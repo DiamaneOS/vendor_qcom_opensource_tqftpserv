@@ -535,6 +535,12 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	}
 
 	client = calloc(1, sizeof(*client));
+	if (!client) {
+		log_err("Memory allocation failure\n");
+		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporarily unavailable");
+		/* client is NULL; free(NULL) is a no-op, fd and sock get closed */
+		goto out_free_client;
+	}
 	client->sq = *sq;
 	client->sock = sock;
 	client->fd = fd;
@@ -548,7 +554,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	client->blk_buf = calloc(1, blksize + 4);
 	if (!client->blk_buf) {
 		log_err("Memory allocation failure\n");
-		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporary unavailable");
+		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporarily unavailable");
 		goto out_free_client;
 		return;
 	}
@@ -679,6 +685,12 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	}
 
 	client = calloc(1, sizeof(*client));
+	if (!client) {
+		log_err("Memory allocation failure\n");
+		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporary unavailable");
+		/* client is NULL; free(NULL) is a no-op, fd and sock get closed */
+		goto out_free_client;
+	}
 	client->sq = *sq;
 	client->sock = sock;
 	client->fd = fd;
