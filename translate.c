@@ -339,6 +339,41 @@ int translate_open(const char *path, int flags)
 	return -1;
 }
 
+/**
+ * translate_unlink() - delete a file after translating path
+ * @path:	path requested by the client
+ *
+ * Only files in the readwrite directory can be deleted. A symbolic link is
+ * deleted itself, never its target, and directories are refused.
+ *
+ * Return: 0 on success, -1 otherwise
+ */
+int translate_unlink(const char *path)
+{
+	const char *name;
+	int dirfd;
+	int ret;
+	int err;
+
+	if (sanitize_path(path) < 0 ||
+	    strncmp(path, READWRITE_PATH, strlen(READWRITE_PATH))) {
+		warnx("unlink of %s rejected", path);
+		errno = EACCES;
+		return -1;
+	}
+
+	dirfd = open_rw_parent(path + strlen(READWRITE_PATH), &name);
+	if (dirfd < 0)
+		return -1;
+
+	ret = unlinkat(dirfd, name, 0);
+	err = errno;
+	close(dirfd);
+	errno = err;
+
+	return ret;
+}
+
 /* linux-firmware uses .xz as file extension */
 #define XZ_EXTENSION ".xz"
 /* linux-firmware uses .zst as file extension */
