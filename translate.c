@@ -43,7 +43,12 @@ static int open_maybe_compressed(const char *path);
 static void read_fw_path_from_sysfs(char *outbuffer, size_t bufsize)
 {
 	size_t pathsize;
-	FILE *f = fopen("/sys/module/firmware_class/parameters/path", "rt");
+	FILE *f;
+
+	/* Empty unless a path is read below */
+	outbuffer[0] = '\0';
+
+	f = fopen("/sys/module/firmware_class/parameters/path", "rt");
 	if (!f)
 		return;
 	pathsize = fread(outbuffer, sizeof(char), bufsize, f);
@@ -111,13 +116,14 @@ static int translate_readonly(const char *file)
 		if (firmware_fd < 0)
 			continue;
 
-		n = read(firmware_fd, firmware_value, sizeof(firmware_value));
+		n = read(firmware_fd, firmware_value, sizeof(firmware_value) - 1);
 		close(firmware_fd);
 		if (n < 0) {
 			continue;
 		}
 		firmware_value[n] = '\0';
 
+		free(firmware_value_copy);
 		firmware_value_copy = strdup(firmware_value);
 		firmware_path = dirname(firmware_value_copy);
 
