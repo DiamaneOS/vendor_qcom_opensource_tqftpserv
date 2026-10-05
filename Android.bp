@@ -5,5 +5,7 @@ cc_binary {
         "tqftpserv.c",
         "translate.c",
     ],
-    shared_libs: ["libqrtr"],
+    // Static, so tqftpserv neither needs nor installs a shared libqrtr.
+    // The device may ship its own libqrtr.so for other users.
+    static_libs: ["libqrtr"],
 }
