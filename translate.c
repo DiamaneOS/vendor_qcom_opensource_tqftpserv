@@ -168,17 +168,79 @@ static int translate_readonly(const char *file)
 }
 
 /**
+ * open_rw_parent() - open the directory holding a file in the readwrite directory
+ * @file:	relative path of the file, with /readwrite/ stripped
+ * @name:	set to the last path component of @file
+ *
+ * Walks @file one component at a time from the readwrite directory and
+ * refuses symbolic links, so the directory returned is always inside the
+ * readwrite directory.
+ *
+ * Return: directory fd on success, -1 otherwise
+ */
+static int open_rw_parent(const char *file, const char **name)
+{
+	char component[NAME_MAX + 1];
+	const char *slash;
+	size_t len;
+	int dirfd;
+	int fd;
+	int err;
+
+	dirfd = open(TQFTPSERV_RW_DIR, O_RDONLY | O_DIRECTORY);
+	if (dirfd < 0) {
+		warn("failed to open tqftpserv readwrite directory");
+		return -1;
+	}
+
+	while ((slash = strchr(file, '/')) != NULL) {
+		len = slash - file;
+		if (len == 0 || len > NAME_MAX) {
+			errno = EINVAL;
+			goto err;
+		}
+		memcpy(component, file, len);
+		component[len] = '\0';
+
+		fd = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+		if (fd < 0)
+			goto err;
+		close(dirfd);
+		dirfd = fd;
+		file = slash + 1;
+	}
+
+	if (*file == '\0') {
+		errno = EINVAL;
+		goto err;
+	}
+
+	*name = file;
+	return dirfd;
+
+err:
+	err = errno;
+	close(dirfd);
+	errno = err;
+	return -1;
+}
+
+/**
  * translate_readwrite() - open "file" from the persistent readwrite directory
  * @file:	relative path of the requested file, with /readwrite/ stripped
  * @flags:	flags to be passed to open(2)
+ *
+ * Symbolic links are not followed.
  *
  * Return: opened fd on success, -1 otherwise
  */
 static int translate_readwrite(const char *file, int flags)
 {
-	int base;
+	const char *name;
+	int dirfd;
 	int ret;
 	int fd;
+	int err;
 
 	ret = mkdir(TQFTPSERV_RW_DIR, 0700);
 	if (ret < 0 && errno != EEXIST) {
@@ -186,14 +248,16 @@ static int translate_readwrite(const char *file, int flags)
 		return -1;
 	}
 
-	base = open(TQFTPSERV_RW_DIR, O_RDONLY | O_DIRECTORY);
-	if (base < 0) {
-		warn("failed to open tqftpserv readwrite directory");
+	dirfd = open_rw_parent(file, &name);
+	if (dirfd < 0) {
+		warn("failed to open %s", file);
 		return -1;
 	}
 
-	fd = openat(base, file, flags, 0600);
-	close(base);
+	fd = openat(dirfd, name, flags | O_NOFOLLOW, 0600);
+	err = errno;
+	close(dirfd);
+	errno = err;
 	if (fd < 0)
 		warn("failed to open %s", file);
 
