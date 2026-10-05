@@ -29,7 +29,10 @@
 
 #ifndef ANDROID
 #define FIRMWARE_BASE	"/lib/firmware/"
+/* The host tests (tests/) use a directory of their own */
+#ifndef TQFTPSERV_RW_DIR
 #define TQFTPSERV_RW_DIR	"/var/lib/tqftpserv"
+#endif
 #else
 #define FIRMWARE_BASE	"/vendor/firmware/"
 #define TQFTPSERV_RW_DIR	"/data/vendor/tmp/tqftpserv"
