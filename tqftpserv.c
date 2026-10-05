@@ -716,10 +716,22 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
-	fd = translate_open(filename, O_WRONLY | O_CREAT);
+	/*
+	 * Without "seek" the request writes the whole file, so what was there
+	 * before is dropped, as Qualcomm's server does. With "seek" the client
+	 * rewrites the file from that offset and the rest is kept.
+	 */
+	fd = translate_open(filename, O_WRONLY | O_CREAT | (seek < 0 ? O_TRUNC : 0));
 	if (fd < 0) {
 		log_debug("unable to open %s (%d), reject\n", filename, errno);
 		tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
+		return;
+	}
+
+	if (seek > 0 && lseek(fd, seek, SEEK_SET) < 0) {
+		log_err("unable to seek in %s (%d), reject\n", filename, errno);
+		tftp_send_error_to(sq, TFTP_ERROR_UNDEF, "Seek failed");
+		close(fd);
 		return;
 	}
 
