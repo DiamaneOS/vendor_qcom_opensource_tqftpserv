@@ -1057,6 +1057,9 @@ int main(int argc, char **argv)
 					handle_wrq(buf, len, &sq);
 					break;
 				case OP_ERROR:
+					/* Need the error code. The message follows it */
+					if (len < 4)
+						break;
 					buf[len] = '\0';
 					log_err("received error %d from %d:%d: %s\n",
 						buf[2] << 8 | buf[3], sq.sq_node, sq.sq_port, buf + 4);
