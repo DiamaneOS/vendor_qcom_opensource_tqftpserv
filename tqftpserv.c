@@ -217,7 +217,7 @@ static int tftp_send_ack(int sock, int block)
 
 static int tftp_send_oack(int sock, size_t *blocksize, size_t *tsize,
 			  size_t *wsize, unsigned int *timeoutms, size_t *rsize,
-			  off_t *seek)
+			  off_t *seek, bool ack_unlink)
 {
 	char buf[512];
 	char *end = buf + sizeof(buf);
@@ -305,12 +305,19 @@ static int tftp_send_oack(int sock, size_t *blocksize, size_t *tsize,
 		*p++ = '\0';
 	}
 
+	if (ack_unlink) {
+		if (p + 9 >= end)
+			return -1;
+		memcpy(p, "unlink\0" "0", 9);
+		p += 9;
+	}
+
 	return send(sock, buf, p - buf, 0);
 }
 
 static int parse_options(const char *buf, size_t len, size_t *blksize,
 			 ssize_t *tsize, size_t *wsize, unsigned int *timeoutms,
-			 size_t *rsize, off_t *seek)
+			 size_t *rsize, off_t *seek, bool *do_unlink)
 {
 	const char *opt, *value;
 	long long parsed_val;
@@ -406,6 +413,16 @@ static int parse_options(const char *buf, size_t len, size_t *blksize,
 				return -1;
 			}
 			*seek = (off_t)parsed_val;
+		} else if (!strcmp(opt, "unlink")) {
+			/*
+			 * Delete the file instead of writing it. Like
+			 * Qualcomm's server, the value is not used.
+			 */
+			if (!do_unlink) {
+				log_err("Unlink option used in an RRQ\n");
+				return -1;
+			}
+			*do_unlink = true;
 		} else {
 			log_err("Ignoring unknown option '%s' with value '%s'\n", opt, value);
 		}
@@ -474,7 +491,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	if (p < buf + len) {
 		do_oack = true;
 		ret = parse_options(p, len - (p - buf), &blksize, &tsize, &wsize,
-				    &timeoutms, &rsize, &seek);
+				    &timeoutms, &rsize, &seek, NULL);
 		if (ret < 0) {
 			log_err("Invalid options in RRQ, rejecting\n");
 			tftp_send_error_to(sq, TFTP_ERROR_EOPTNEG, "Option negotiation failed");
@@ -562,7 +579,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 			       wsize ? &wsize : NULL,
 			       &client->timeoutms,
 			       rsize ? &rsize : NULL,
-			       seek >= 0 ? &seek : NULL);
+			       seek >= 0 ? &seek : NULL, false);
 	} else {
 		tftp_send_data(client, 1, 0, 0);
 	}
@@ -575,6 +592,51 @@ out_free_client:
 	free(client);
 	close(fd);
 out_close_sock:
+	close(sock);
+}
+
+/**
+ * handle_unlink() - delete a file on request of the client
+ * @filename: path requested in the WRQ
+ * @sq: remote address of the client
+ * @blksize: negotiated block size, echoed in the OACK
+ * @timeoutms: negotiated timeout, echoed in the OACK
+ *
+ * The modem asks for a read-write file to be deleted with a WRQ that
+ * carries the "unlink" option. Success is acknowledged with an OACK that
+ * echoes the option, and nothing is transferred.
+ */
+static void handle_unlink(const char *filename, struct sockaddr_qrtr *sq,
+			  size_t blksize, unsigned int timeoutms)
+{
+	int sock;
+	int ret;
+	int err;
+
+	if (translate_unlink(filename) < 0) {
+		err = errno;
+		log_err("unable to unlink %s (%d)\n", filename, err);
+		if (err == ENOENT)
+			tftp_send_error_to(sq, TFTP_ERROR_ENOENT, "file not found");
+		else
+			tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
+		return;
+	}
+
+	log_info("%s unlinked by %d:%d\n", filename, sq->sq_node, sq->sq_port);
+
+	sock = qrtr_open(0);
+	if (sock < 0) {
+		log_err("unable to create new qrtr socket, reject\n");
+		return;
+	}
+
+	ret = connect(sock, (struct sockaddr *)sq, sizeof(*sq));
+	if (ret < 0)
+		log_err("unable to connect new qrtr socket to remote\n");
+	else
+		tftp_send_oack(sock, &blksize, NULL, NULL, &timeoutms, NULL, NULL, true);
+
 	close(sock);
 }
 
@@ -593,6 +655,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	size_t wsize = 1;
 	off_t seek = -1;
 	bool do_oack = false;
+	bool do_unlink = false;
 	int sock;
 	int ret;
 	int fd;
@@ -640,7 +703,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	if (p < buf + len) {
 		do_oack = true;
 		ret = parse_options(p, len - (p - buf), &blksize, &tsize, &wsize,
-				    &timeoutms, &rsize, &seek);
+				    &timeoutms, &rsize, &seek, &do_unlink);
 		if (ret < 0) {
 			log_err("Invalid options in WRQ, rejecting\n");
 			tftp_send_error_to(sq, TFTP_ERROR_EOPTNEG, "Option negotiation failed");
@@ -648,10 +711,22 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		}
 	}
 
+	if (do_unlink) {
+		handle_unlink(filename, sq, blksize, timeoutms);
+		return;
+	}
+
 	fd = translate_open(filename, O_WRONLY | O_CREAT);
 	if (fd < 0) {
 		log_debug("unable to open %s (%d), reject\n", filename, errno);
 		tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
+		return;
+	}
+
+	if (seek > 0 && lseek(fd, seek, SEEK_SET) < 0) {
+		log_err("unable to seek in %s (%d), reject\n", filename, errno);
+		tftp_send_error_to(sq, TFTP_ERROR_UNDEF, "Seek failed");
+		close(fd);
 		return;
 	}
 
@@ -703,6 +778,18 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
+	/*
+	 * Without "seek" the request writes the whole file, so what was there
+	 * before is dropped, as Qualcomm's server does. With "seek" the client
+	 * rewrites the file from that offset and the rest is kept. Drop it only
+	 * once the request is accepted: a rejected request changes nothing.
+	 */
+	if (seek < 0 && ftruncate(fd, 0) < 0) {
+		log_err("unable to truncate %s (%d), reject\n", filename, errno);
+		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Truncate failed");
+		goto out_free_rw_buf;
+	}
+
 	log_info("%s opened for writing from %d:%d\n", filename, sq->sq_node, sq->sq_port);
 
 	list_add(&writers, &client->node);
@@ -713,21 +800,24 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 			       wsize ? &wsize : NULL,
 			       &client->timeoutms,
 			       rsize ? &rsize : NULL,
-			       seek >= 0 ? &seek : NULL);
+			       seek >= 0 ? &seek : NULL, false);
 	} else {
-		tftp_send_data(client, 1, 0, 0);
+		/* Without options the first DATA block follows an ACK of block 0 */
+		tftp_send_ack(client->sock, 0);
 	}
 
 	return;
 
+out_free_rw_buf:
+	free(client->rw_buf);
 out_free_blk_buf:
 	free(client->blk_buf);
 out_free_client:
 	free(client);
-out_close_fd:
-	close(fd);
 out_close_sock:
 	close(sock);
+out_close_fd:
+	close(fd);
 }
 
 static int handle_reader(struct tftp_client *client)
