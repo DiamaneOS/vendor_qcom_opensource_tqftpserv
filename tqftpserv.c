@@ -716,12 +716,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
-	/*
-	 * Without "seek" the request writes the whole file, so what was there
-	 * before is dropped, as Qualcomm's server does. With "seek" the client
-	 * rewrites the file from that offset and the rest is kept.
-	 */
-	fd = translate_open(filename, O_WRONLY | O_CREAT | (seek < 0 ? O_TRUNC : 0));
+	fd = translate_open(filename, O_WRONLY | O_CREAT);
 	if (fd < 0) {
 		log_debug("unable to open %s (%d), reject\n", filename, errno);
 		tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
@@ -783,6 +778,18 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
+	/*
+	 * Without "seek" the request writes the whole file, so what was there
+	 * before is dropped, as Qualcomm's server does. With "seek" the client
+	 * rewrites the file from that offset and the rest is kept. Drop it only
+	 * once the request is accepted: a rejected request changes nothing.
+	 */
+	if (seek < 0 && ftruncate(fd, 0) < 0) {
+		log_err("unable to truncate %s (%d), reject\n", filename, errno);
+		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Truncate failed");
+		goto out_free_rw_buf;
+	}
+
 	log_info("%s opened for writing from %d:%d\n", filename, sq->sq_node, sq->sq_port);
 
 	list_add(&writers, &client->node);
@@ -795,19 +802,22 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 			       rsize ? &rsize : NULL,
 			       seek >= 0 ? &seek : NULL, false);
 	} else {
-		tftp_send_data(client, 1, 0, 0);
+		/* Without options the first DATA block follows an ACK of block 0 */
+		tftp_send_ack(client->sock, 0);
 	}
 
 	return;
 
+out_free_rw_buf:
+	free(client->rw_buf);
 out_free_blk_buf:
 	free(client->blk_buf);
 out_free_client:
 	free(client);
-out_close_fd:
-	close(fd);
 out_close_sock:
 	close(sock);
+out_close_fd:
+	close(fd);
 }
 
 static int handle_reader(struct tftp_client *client)
