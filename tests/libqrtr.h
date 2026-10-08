@@ -18,9 +18,10 @@ struct sockaddr_qrtr {
 
 #define QRTR_PORT_CTRL	0xfffffffeu
 
+/* As enum qrtr_pkt_type in the kernel's include/uapi/linux/qrtr.h */
 enum {
 	QRTR_TYPE_DATA = 1,
-	QRTR_TYPE_BYE = 4,
+	QRTR_TYPE_BYE = 3,
 	QRTR_TYPE_DEL_CLIENT = 6,
 };
 
