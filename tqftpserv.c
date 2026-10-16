@@ -1147,7 +1147,7 @@ int main(int argc, char **argv)
 					handle_wrq(buf, len, &sq);
 					break;
 				case OP_ERROR:
-					/* Need the error code; the message follows it */
+					/* Need the error code. The message follows it */
 					if (len < 4)
 						break;
 					buf[len] = '\0';

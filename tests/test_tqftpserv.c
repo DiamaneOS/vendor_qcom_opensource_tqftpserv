@@ -5,7 +5,7 @@
  * tqftpserv.c and translate.c are compiled into this file. QRTR sockets
  * are replaced by local datagram socket pairs, the readwrite directory by
  * a temporary one, so the handlers can be fed packets directly. Each test
- * runs in its own process; build with AddressSanitizer (see Makefile) so
+ * runs in its own process. Build with AddressSanitizer (see Makefile) so
  * memory errors fail the test.
  */
 #include <sys/socket.h>
@@ -142,7 +142,7 @@ static void *test_calloc(size_t n, size_t size)
 	} \
 } while (0)
 
-/* Builds a request; the variable arguments are option/value pairs, then NULL */
+/* Builds a request. The variable arguments are option/value pairs, then NULL */
 static size_t request(char *buf, int opcode, const char *path, ...)
 {
 	const char *s;
@@ -262,7 +262,7 @@ static void write_request(const char *path, const char *data, const char *opt, c
 	client_close_and_free(client);
 }
 
-/* An unlink request; returns the opcode of the reply */
+/* An unlink request. Returns the opcode of the reply */
 static int unlink_request(const char *path, char *buf, size_t size, ssize_t *n)
 {
 	size_t len;
@@ -322,7 +322,7 @@ static void test_request_error_fills_buffer(void)
 	ctrl_lens[0] = sizeof(big);
 	ctrl_pkts[1] = short_error;
 	ctrl_lens[1] = sizeof(short_error);
-	/* Keeps the socket readable; its read fails and main() returns */
+	/* Keeps the socket readable. Its read fails and main() returns */
 	ctrl_pkts[2] = other;
 	ctrl_lens[2] = sizeof(other);
 	ctrl_npkts = 3;
@@ -682,7 +682,7 @@ static void remove_tree(const char *path)
 		warnx("could not remove %s", path);
 }
 
-/* Runs one test in a child with its own directories; true if it passed */
+/* Runs one test in a child with its own directories. True if it passed */
 static bool run(int i, const char *tmp)
 {
 	char base[PATH_MAX];
