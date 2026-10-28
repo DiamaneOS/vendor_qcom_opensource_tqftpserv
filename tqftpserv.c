@@ -959,7 +959,7 @@ static int handle_writer(struct tftp_client *client)
 
 		/* Set blk_expected to beginning of current window */
 		if ((blk_expected % client->wsize) == 0)
-			blk_expected -= client->wsize + 1;
+			blk_expected = (uint16_t)((int)blk_expected - (int)client->wsize - 1);
 		else
 			blk_expected -= (blk_expected % client->wsize) - 1;
 

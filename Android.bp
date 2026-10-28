@@ -8,4 +8,14 @@ cc_binary {
     // Static, so tqftpserv neither needs nor installs a shared libqrtr.
     // The device may ship its own libqrtr.so for other users.
     static_libs: ["libqrtr"],
+    sanitize: {
+        integer_overflow: true,
+        misc_undefined: ["bounds"],
+    },
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wno-sign-compare",
+        "-Wno-unused-parameter",
+    ],
 }
