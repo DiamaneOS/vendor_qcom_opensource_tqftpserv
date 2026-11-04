@@ -9,6 +9,7 @@ cc_binary {
     // The device may ship its own libqrtr.so for other users.
     static_libs: ["libqrtr"],
     sanitize: {
+        cfi: true,
         integer_overflow: true,
         misc_undefined: ["bounds"],
     },
