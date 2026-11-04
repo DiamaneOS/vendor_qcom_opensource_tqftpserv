@@ -51,6 +51,14 @@ static int ctrl_reads_left;
 /* Fail the n-th calloc() from now (0: never) */
 static int fail_calloc_at;
 
+/* What qrtr_decode() reports */
+static struct qrtr_packet decoded = { .type = QRTR_TYPE_DATA };
+
+/* The next reads on a session socket seem to come from here, when set */
+static const struct sockaddr_qrtr *stray_sender;
+
+#define LOCAL_NODE 9
+
 int qrtr_open(int rport)
 {
 	int size = BUF_SIZE;
@@ -87,8 +95,7 @@ int qrtr_publish(int sock, uint32_t service, uint16_t version, uint16_t instance
 int qrtr_decode(struct qrtr_packet *dest, void *buf, size_t len,
 		const struct sockaddr_qrtr *sq)
 {
-	memset(dest, 0, sizeof(*dest));
-	dest->type = QRTR_TYPE_DATA;
+	*dest = decoded;
 	return 0;
 }
 
@@ -103,10 +110,19 @@ static ssize_t test_recvfrom(int fd, void *buf, size_t len, int flags,
 		return -1;
 	}
 	if (addr) {
-		memcpy(addr, &remote, sizeof(remote));
+		memcpy(addr, stray_sender ? stray_sender : &remote, sizeof(remote));
 		*addrlen = sizeof(remote);
 	}
 	return recv(fd, buf, len, flags);
+}
+
+static int test_getsockname(int fd, struct sockaddr *addr, socklen_t *len)
+{
+	const struct sockaddr_qrtr local = { 42, LOCAL_NODE, 200 };
+
+	memcpy(addr, &local, sizeof(local));
+	*len = sizeof(local);
+	return 0;
 }
 
 static int test_connect(int fd, const struct sockaddr *addr, socklen_t len)
@@ -123,6 +139,7 @@ static void *test_calloc(size_t n, size_t size)
 
 #define recvfrom test_recvfrom
 #define connect test_connect
+#define getsockname test_getsockname
 #define calloc test_calloc
 #define main tqftpserv_main
 #define TQFTPSERV_RW_DIR test_rw_dir
@@ -130,6 +147,7 @@ static void *test_calloc(size_t n, size_t size)
 #include "../translate.c"
 #undef recvfrom
 #undef connect
+#undef getsockname
 #undef calloc
 #undef main
 
@@ -200,6 +218,12 @@ static struct tftp_client *newest(struct list_head *list)
 static void rw_path(char *out, const char *name)
 {
 	snprintf(out, PATH_MAX, "%s/%s", test_rw_dir, name);
+}
+
+static const char *rw_path_of(char *out, const char *name)
+{
+	rw_path(out, name);
+	return out;
 }
 
 static void write_file(const char *path, const char *data)
@@ -653,6 +677,300 @@ static void test_modem_mcfg_sequence(void)
 	CHECK(!exists(path));
 }
 
+/* Limits */
+
+/* Opens a read of an existing file. True if a session came of it */
+static bool open_read(const struct sockaddr_qrtr *sq)
+{
+	char buf[1024];
+	int before = 0;
+	int after = 0;
+	struct tftp_client *client;
+	size_t len;
+
+	list_for_each_entry(client, &readers, node)
+		before++;
+	len = request(buf, OP_RRQ, "/readwrite/f", "blksize", "512", "tsize", "0", NULL);
+	handle_rrq(buf, len, (struct sockaddr_qrtr *)sq);
+	list_for_each_entry(client, &readers, node)
+		after++;
+	return after > before;
+}
+
+static void test_window_is_capped(void)
+{
+	char buf[1024];
+	char big[16];
+	size_t len;
+
+	/* 64 KiB blocks in 65535 blocks: about 4 GB of buffer per transfer */
+	len = request(buf, OP_WRQ, "/readwrite/w", "blksize", "65464", "wsize", "65535", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_EOPTNEG);
+
+	/* Within each limit, over them together */
+	len = request(buf, OP_WRQ, "/readwrite/w", "blksize", "65464", "wsize", "17", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+
+	snprintf(big, sizeof(big), "%d", MAX_WSIZE + 1);
+	len = request(buf, OP_RRQ, "/readwrite/w", "blksize", "512", "wsize", big, NULL);
+	handle_rrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&readers));
+}
+
+/* wsize 65535 once wrapped the loop's 16-bit block and it never ended */
+static void test_reader_window_ends(void)
+{
+	struct tftp_client *client;
+	char path[PATH_MAX];
+	char wsize[16];
+	char buf[1024];
+	size_t len;
+	int sent = 0;
+
+	rw_path(path, "r");
+	write_file(path, "0123456789");
+	snprintf(wsize, sizeof(wsize), "%d", MAX_WSIZE);
+	len = request(buf, OP_RRQ, "/readwrite/r", "blksize", "8", "rsize", "104857600",
+		      "wsize", wsize, NULL);
+	handle_rrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	client = newest(&readers);
+	CHECK(client);
+	CHECK(!client->rw_buf);
+	CHECK(reply_opcode(peer_of[client->sock], buf, sizeof(buf)) == OP_OACK);
+
+	/* An ACK from high in the block range, where the old loop bound passed 65535 */
+	memcpy(buf, "\0\4\377\377", 4);
+	CHECK(send(peer_of[client->sock], buf, 4, 0) == 4);
+	CHECK(handle_reader(client) == 1);
+	while (reply(peer_of[client->sock], buf, sizeof(buf)) >= 0)
+		sent++;
+	CHECK(sent == MAX_WSIZE);
+	client_close_and_free(client);
+}
+
+static void test_sessions_are_capped(void)
+{
+	const struct sockaddr_qrtr other = { 42, 5, 100 };
+	const struct sockaddr_qrtr third = { 42, 10, 100 };
+	struct sockaddr_qrtr sq;
+	char path[PATH_MAX];
+	char buf[256];
+	int i;
+
+	rw_path(path, "f");
+	write_file(path, "0123456789");
+
+	sq = remote;
+	for (i = 0; i < MAX_NODE_SESSIONS; i++) {
+		sq.sq_port = 1000 + i;
+		CHECK(open_read(&sq));
+	}
+	/* One node is full, another still gets its share */
+	CHECK(!open_read(&sq));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(open_read(&other));
+
+	sq = other;
+	for (i = 1; i < MAX_NODE_SESSIONS; i++) {
+		sq.sq_port = 2000 + i;
+		CHECK(open_read(&sq));
+	}
+	/* Every transfer in use */
+	CHECK(!open_read(&third));
+
+	/* A write counts too, and an unlink needs no transfer */
+	sq = third;
+	CHECK(unlink_request("/readwrite/f", buf, sizeof(buf), &(ssize_t){ 0 }) == OP_OACK);
+	write_file(path, "0123456789");
+	close_sessions(remote.sq_node, 0, true);
+	CHECK(open_read(&third));
+}
+
+static void test_idle_sessions_end(void)
+{
+	struct tftp_client *busy;
+	struct tftp_client *idle;
+	char path[PATH_MAX];
+	char buf[1024];
+	size_t len;
+	long long now = now_ms();
+
+	rw_path(path, "f");
+	write_file(path, "0123456789");
+	CHECK(open_read(&remote));
+	idle = newest(&readers);
+	CHECK(open_read(&remote));
+	busy = newest(&readers);
+	idle->last_active_ms = now - SESSION_IDLE_MS;
+	busy->last_active_ms = now - SESSION_IDLE_MS + 1;
+
+	len = request(buf, OP_WRQ, "/readwrite/g", "blksize", "512", "timeoutms", "5000", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(newest(&writers));
+	newest(&writers)->last_active_ms = now - SESSION_IDLE_MS;
+
+	reap_idle_sessions(now);
+	CHECK(list_empty(&writers));
+	CHECK(newest(&readers) == busy);
+	CHECK(busy->node.prev == &readers);
+
+	/* A packet from the peer counts as activity, a stray one does not */
+	busy->last_active_ms = now - SESSION_IDLE_MS;
+	stray_sender = &(struct sockaddr_qrtr){ 42, 5, 100 };
+	memcpy(buf, "\0\4\0\0", 4);
+	CHECK(send(peer_of[busy->sock], buf, 4, 0) == 4);
+	CHECK(handle_reader(busy) == 1);
+	CHECK(busy->last_active_ms == now - SESSION_IDLE_MS);
+	stray_sender = NULL;
+	CHECK(send(peer_of[busy->sock], buf, 4, 0) == 4);
+	CHECK(handle_reader(busy) >= 0);
+	CHECK(busy->last_active_ms >= now);
+}
+
+static void test_stray_packet_keeps_the_session(void)
+{
+	const struct sockaddr_qrtr stray = { 42, 5, 100 };
+	struct tftp_client *client;
+	char path[PATH_MAX];
+	char buf[1024];
+	size_t len;
+
+	rw_path(path, "f");
+	write_file(path, "0123456789");
+	CHECK(open_read(&remote));
+	client = newest(&readers);
+	stray_sender = &stray;
+	memcpy(buf, "\0\5\0\1x", 6);
+	CHECK(send(peer_of[client->sock], buf, 6, 0) == 6);
+	CHECK(handle_reader(client) == 1);
+
+	stray_sender = NULL;
+	len = request(buf, OP_WRQ, "/readwrite/g", "blksize", "512", "timeoutms", "5000", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	client = newest(&writers);
+	CHECK(client);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_OACK);
+	stray_sender = &stray;
+	CHECK(send_data(client, 1, "bad", 3) == 1);
+	stray_sender = NULL;
+	CHECK(client->blk_expected == 1);
+	CHECK(send_data(client, 1, "good", 4) == 0);
+	client_close_and_free(client);
+	read_file(rw_path_of(path, "g"), buf, sizeof(buf));
+	CHECK(!strcmp(buf, "good"));
+}
+
+/* A file and the whole directory have budgets, and so has the number of files */
+static void test_write_budgets(void)
+{
+	struct tftp_client *client;
+	char path[PATH_MAX];
+	char name[32];
+	char seek[32];
+	char buf[1024];
+	size_t len;
+	int i;
+
+	/* Past the file budget at the start */
+	snprintf(seek, sizeof(seek), "%d", TQFTPSERV_MAX_FILE_BYTES + 1);
+	len = request(buf, OP_WRQ, "/readwrite/big", "blksize", "512", "seek", seek, NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
+	rw_path(path, "big");
+	CHECK(!exists(path));
+
+	/* Across the file budget by a write */
+	snprintf(seek, sizeof(seek), "%d", TQFTPSERV_MAX_FILE_BYTES - 1);
+	len = request(buf, OP_WRQ, "/readwrite/big", "blksize", "512", "seek", seek, NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	client = newest(&writers);
+	CHECK(client);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_OACK);
+	CHECK(send_data(client, 1, "ab", 2) == -1);
+	CHECK(reply_opcode(peer_of[client->sock], buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
+	client_close_and_free(client);
+	unlink(path);
+
+	/* Just under the total, then over it */
+	rw_path(path, "fill");
+	write_file(path, "");
+	CHECK(truncate(path, TQFTPSERV_MAX_RW_BYTES - 3) == 0);
+	len = request(buf, OP_WRQ, "/readwrite/t", "blksize", "512", "timeoutms", "5000", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	client = newest(&writers);
+	CHECK(client);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_OACK);
+	CHECK(send_data(client, 1, "abcd", 4) == -1);
+	client_close_and_free(client);
+	/* Overwriting in place costs nothing */
+	write_request("/readwrite/t", "abc", "timeoutms", "5000");
+	unlink(path);
+
+	/* The number of files. An existing one still opens */
+	for (i = 0; i < TQFTPSERV_MAX_RW_FILES; i++) {
+		snprintf(name, sizeof(name), "n%d", i);
+		rw_path(path, name);
+		write_file(path, "");
+	}
+	len = request(buf, OP_WRQ, "/readwrite/extra", "blksize", "512", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
+	rw_path(path, "extra");
+	CHECK(!exists(path));
+	write_request("/readwrite/n0", "x", "timeoutms", "5000");
+}
+
+/* The name service reports a client or a node going away, as on a modem restart */
+static void test_control_ends_sessions(void)
+{
+	const struct sockaddr_qrtr other = { 42, 5, 100 };
+	const struct sockaddr_qrtr ns = { 42, LOCAL_NODE, QRTR_PORT_CTRL };
+	const struct sockaddr_qrtr forged = { 42, 5, QRTR_PORT_CTRL };
+	struct sockaddr_qrtr port2 = remote;
+	struct tftp_client *client;
+	char path[PATH_MAX];
+	char buf[1024];
+	size_t len;
+
+	port2.sq_port = 101;
+	rw_path(path, "f");
+	write_file(path, "0123456789");
+	CHECK(open_read(&remote));
+	CHECK(open_read(&port2));
+	CHECK(open_read(&other));
+	len = request(buf, OP_WRQ, "/readwrite/g", "blksize", "512", "timeoutms", "5000", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(newest(&writers));
+
+	/* Only the name service speaks for a node */
+	decoded = (struct qrtr_packet){ .type = QRTR_TYPE_BYE, .node = remote.sq_node };
+	CHECK(handle_control(buf, 4, &forged, LOCAL_NODE) == 0);
+	CHECK(!list_empty(&writers));
+
+	decoded = (struct qrtr_packet){ .type = QRTR_TYPE_DEL_CLIENT, .node = remote.sq_node, .port = 101 };
+	CHECK(handle_control(buf, 4, &ns, LOCAL_NODE) == 0);
+	list_for_each_entry(client, &readers, node)
+		CHECK(!(client->sq.sq_node == remote.sq_node && client->sq.sq_port == 101));
+	CHECK(!list_empty(&writers));
+
+	decoded = (struct qrtr_packet){ .type = QRTR_TYPE_BYE, .node = remote.sq_node };
+	CHECK(handle_control(buf, 4, &ns, LOCAL_NODE) == 0);
+	CHECK(list_empty(&writers));
+	client = newest(&readers);
+	CHECK(client && client->sq.sq_node == other.sq_node);
+	CHECK(client->node.prev == &readers);
+}
+
 static const struct {
 	const char *name;
 	void (*fn)(void);
@@ -671,6 +989,13 @@ static const struct {
 	{ "write_without_options", test_write_without_options },
 	{ "write_with_seek_keeps_the_rest", test_write_with_seek_keeps_the_rest },
 	{ "modem_mcfg_sequence", test_modem_mcfg_sequence },
+	{ "window_is_capped", test_window_is_capped },
+	{ "reader_window_ends", test_reader_window_ends },
+	{ "sessions_are_capped", test_sessions_are_capped },
+	{ "idle_sessions_end", test_idle_sessions_end },
+	{ "stray_packet_keeps_the_session", test_stray_packet_keeps_the_session },
+	{ "write_budgets", test_write_budgets },
+	{ "control_ends_sessions", test_control_ends_sessions },
 };
 
 static void remove_tree(const char *path)

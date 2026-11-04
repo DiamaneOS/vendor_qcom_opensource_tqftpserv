@@ -3,6 +3,7 @@
  * Copyright (c) 2018, Linaro Ltd.
  */
 #include <arpa/inet.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "list.h"
@@ -23,9 +25,21 @@
 #define MIN_BLKSIZE 8
 #define MAX_BLKSIZE 65464
 
-/* RFC 7440: TFTP Windowsize Option - valid range 1 to 65535 */
+/* RFC 7440 allows up to 65535. The modem asks for 10 blocks of 7680 bytes */
 #define MIN_WSIZE 1
-#define MAX_WSIZE 65535
+#define MAX_WSIZE 256
+#define MAX_WINDOW_BYTES (1024 * 1024)
+
+/*
+ * A boot opens about ten transfers from the modem, seven of them at once.
+ * The second limit keeps one remote processor from taking every transfer.
+ */
+#define MAX_SESSIONS 64
+#define MAX_NODE_SESSIONS 32
+
+/* The modem retries within seconds, so a transfer this quiet is dead */
+#define SESSION_IDLE_MS (120 * 1000)
+#define REAP_INTERVAL_SEC 10
 
 /* Reasonable limits for custom options */
 #define MAX_RSIZE (100 * 1024 * 1024)  /* 100 MB */
@@ -77,12 +91,41 @@ struct tftp_client {
 	size_t rw_buf_size;
 	size_t blk_offset;
 	uint16_t blk_expected;
+
+	long long last_active_ms;
 };
 
 static bool tftp_debug;
 
 static struct list_head readers = LIST_INIT(readers);
 static struct list_head writers = LIST_INIT(writers);
+
+static long long now_ms(void)
+{
+	struct timespec ts;
+
+	/* Not CLOCK_BOOTTIME: a suspended phone must not age a transfer */
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+/* True if @sq may open another transfer. */
+static bool session_slot_free(const struct sockaddr_qrtr *sq)
+{
+	struct tftp_client *client;
+	int total = 0;
+	int node = 0;
+
+	list_for_each_entry(client, &readers, node) {
+		total++;
+		node += client->sq.sq_node == sq->sq_node;
+	}
+	list_for_each_entry(client, &writers, node) {
+		total++;
+		node += client->sq.sq_node == sq->sq_node;
+	}
+	return total < MAX_SESSIONS && node < MAX_NODE_SESSIONS;
+}
 
 static void log_debug(const char *fmt, ...)
 {
@@ -502,6 +545,12 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	log_debug("read request for %s (mode: %s, rsize: %d, seek: %d) from %d:%d\n",
 		  filename, mode, rsize, seek, sq->sq_node, sq->sq_port);
 
+	if (!session_slot_free(sq)) {
+		log_err("too many transfers, refusing a read from %d:%d\n", sq->sq_node, sq->sq_port);
+		tftp_send_error_to(sq, TFTP_ERROR_UNDEF, "Too many transfers");
+		return;
+	}
+
 	sock = qrtr_open(0);
 	if (sock < 0) {
 		log_err("unable to create new qrtr socket, reject\n");
@@ -551,21 +600,13 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	client->wsize = wsize;
 	client->timeoutms = timeoutms;
 	client->seek = seek < 0 ? 0 : seek;
-	client->rw_buf_size = blksize * wsize;
+	client->last_active_ms = now_ms();
 
 	client->blk_buf = calloc(1, blksize + 4);
 	if (!client->blk_buf) {
 		log_err("Memory allocation failure\n");
 		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporarily unavailable");
 		goto out_free_client;
-		return;
-	}
-
-	client->rw_buf = calloc(1, client->rw_buf_size);
-	if (!client->rw_buf) {
-		log_err("Memory allocation failure\n");
-		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporary unavailable");
-		goto out_free_blk_buf;
 		return;
 	}
 
@@ -586,8 +627,6 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 
 	return;
 
-out_free_blk_buf:
-	free(client->blk_buf);
 out_free_client:
 	free(client);
 	close(fd);
@@ -716,10 +755,31 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
+	if (blksize * wsize > MAX_WINDOW_BYTES) {
+		log_err("window of %zu blocks of %zu bytes refused\n", wsize, blksize);
+		tftp_send_error_to(sq, TFTP_ERROR_EOPTNEG, "Option negotiation failed");
+		return;
+	}
+
+	if (seek > TQFTPSERV_MAX_FILE_BYTES) {
+		log_err("write at offset %lld refused\n", (long long)seek);
+		tftp_send_error_to(sq, TFTP_ERROR_ENOSPACE, "File too large");
+		return;
+	}
+
+	if (!session_slot_free(sq)) {
+		log_err("too many transfers, refusing a write from %d:%d\n", sq->sq_node, sq->sq_port);
+		tftp_send_error_to(sq, TFTP_ERROR_UNDEF, "Too many transfers");
+		return;
+	}
+
 	fd = translate_open(filename, O_WRONLY | O_CREAT);
 	if (fd < 0) {
 		log_debug("unable to open %s (%d), reject\n", filename, errno);
-		tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
+		if (errno == ENOSPC)
+			tftp_send_error_to(sq, TFTP_ERROR_ENOSPACE, "Too many files");
+		else
+			tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
 		return;
 	}
 
@@ -761,6 +821,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	client->seek = seek < 0 ? 0 : seek;
 	client->rw_buf_size = blksize * wsize;
 	client->blk_expected = 1;
+	client->last_active_ms = now_ms();
 
 	client->blk_buf = calloc(1, blksize + 4);
 	if (!client->blk_buf) {
@@ -823,9 +884,10 @@ out_close_fd:
 static int handle_reader(struct tftp_client *client)
 {
 	struct sockaddr_qrtr sq;
-	uint16_t block;
+	unsigned int block;
 	uint16_t last;
-	char buf[128];
+	/* Unsigned: char is signed on some hosts, and block numbers go past 0x7fff */
+	uint8_t buf[128];
 	socklen_t sl;
 	ssize_t len;
 	ssize_t n = 0;
@@ -842,12 +904,14 @@ static int handle_reader(struct tftp_client *client)
 		return -1;
 	}
 
-	/* Drop unsolicited messages */
+	/* Drop unsolicited messages, and keep the transfer */
 	if (sq.sq_node != client->sq.sq_node ||
 	    sq.sq_port != client->sq.sq_port) {
 		log_debug("Discarding spoofed message\n");
-		return -1;
+		return 1;
 	}
+
+	client->last_active_ms = now_ms();
 
 	/* Need at least opcode and block/error fields */
 	if (len < 4) {
@@ -879,7 +943,7 @@ static int handle_reader(struct tftp_client *client)
 	if (last * client->blksize > client->rsize)
 		return 0;
 
-	for (block = last; block < last + client->wsize; block++) {
+	for (block = last; block < (unsigned int)last + client->wsize; block++) {
 		size_t offset = client->seek + block * client->blksize;
 		size_t response_size = 0;
 		/* Check if need to limit response size based for requested rsize */
@@ -923,10 +987,12 @@ static int handle_writer(struct tftp_client *client)
 		return -1;
 	}
 
-	/* Drop unsolicited messages */
+	/* Drop unsolicited messages, and keep the transfer */
 	if (sq.sq_node != client->sq.sq_node ||
 	    sq.sq_port != client->sq.sq_port)
-		return -1;
+		return 1;
+
+	client->last_active_ms = now_ms();
 
 	/*
 	 * Need at least opcode and block fields; without this a short packet
@@ -978,6 +1044,12 @@ static int handle_writer(struct tftp_client *client)
 	/* Write to file if all the wsize blocks are recieved
 	 * or received buffer that is less than blksize */
 	if ((block % client->wsize == 0) || (payload < client->blksize)) {
+		if (!translate_write_allowed(client->fd, client->blk_offset)) {
+			log_err("write over the budget refused from %d:%d\n", sq.sq_node, sq.sq_port);
+			tftp_send_error(client->sock, TFTP_ERROR_ENOSPACE, "Disk full or write error");
+			return -1;
+		}
+
 		ret = write(client->fd, client->rw_buf, client->blk_offset);
 		if (ret < 0) {
 			log_err("failed to write data: %s\n", strerror(errno));
@@ -1002,6 +1074,77 @@ static void client_close_and_free(struct tftp_client *client)
 	free(client);
 }
 
+/* Ends the transfers of a node, or of one port with @any_port false. */
+static void close_sessions(unsigned int node, unsigned int port, bool any_port)
+{
+	struct tftp_client *client;
+	struct tftp_client *next;
+	struct list_head *lists[] = { &readers, &writers };
+	size_t i;
+
+	for (i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+		list_for_each_entry_safe(client, next, lists[i], node) {
+			if (client->sq.sq_node == node &&
+			    (any_port || client->sq.sq_port == port))
+				client_close_and_free(client);
+		}
+	}
+}
+
+static void reap_idle_sessions(long long now)
+{
+	struct tftp_client *client;
+	struct tftp_client *next;
+	struct list_head *lists[] = { &readers, &writers };
+	size_t i;
+
+	for (i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+		list_for_each_entry_safe(client, next, lists[i], node) {
+			if (now - client->last_active_ms >= SESSION_IDLE_MS) {
+				log_err("closing an idle transfer of %d:%d\n",
+					client->sq.sq_node, client->sq.sq_port);
+				client_close_and_free(client);
+			}
+		}
+	}
+}
+
+/*
+ * The name service tells a published service about a client or a whole node
+ * going away, as when the modem restarts. It runs on this node, so anything
+ * else that claims the control port is ignored.
+ */
+static int handle_control(void *buf, size_t len, const struct sockaddr_qrtr *sq,
+			  unsigned int local_node)
+{
+	struct qrtr_packet pkt;
+	int ret;
+
+	if (sq->sq_node != local_node) {
+		log_err("control message from node %d ignored\n", sq->sq_node);
+		return 0;
+	}
+
+	ret = qrtr_decode(&pkt, buf, len, sq);
+	if (ret < 0) {
+		fprintf(stderr, "unable to decode qrtr packet\n");
+		return ret;
+	}
+
+	switch (pkt.type) {
+	case QRTR_TYPE_BYE:
+		log_debug("got bye for %d\n", pkt.node);
+		close_sessions(pkt.node, 0, true);
+		break;
+	case QRTR_TYPE_DEL_CLIENT:
+		log_debug("got del_client for %d:%d\n", pkt.node, pkt.port);
+		close_sessions(pkt.node, pkt.port, false);
+		break;
+	}
+
+	return 0;
+}
+
 static void print_usage(void)
 {
 	extern const char *__progname;
@@ -1016,7 +1159,8 @@ int main(int argc, char **argv)
 	struct tftp_client *client;
 	struct tftp_client *next;
 	struct sockaddr_qrtr sq;
-	struct qrtr_packet pkt;
+	struct timeval reap_tv;
+	unsigned int local_node;
 	socklen_t sl;
 	ssize_t len;
 	char buf[4096];
@@ -1058,6 +1202,13 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
+	sl = sizeof(sq);
+	if (getsockname(fd, (void *)&sq, &sl) < 0) {
+		fprintf(stderr, "failed to read the local node\n");
+		exit(1);
+	}
+	local_node = sq.sq_node;
+
 	for (;;) {
 		FD_ZERO(&rfds);
 		FD_SET(fd, &rfds);
@@ -1073,7 +1224,10 @@ int main(int argc, char **argv)
 			nfds = MAX(nfds, client->sock);
 		}
 
-		ret = select(nfds + 1, &rfds, NULL, NULL, NULL);
+		/* No timer without a transfer: an idle phone is not woken for this */
+		reap_tv = (struct timeval){ .tv_sec = REAP_INTERVAL_SEC };
+		ret = select(nfds + 1, &rfds, NULL, NULL,
+			     list_empty(&readers) && list_empty(&writers) ? NULL : &reap_tv);
 		if (ret < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -1099,6 +1253,8 @@ int main(int argc, char **argv)
 			}
 		}
 
+		reap_idle_sessions(now_ms());
+
 		if (FD_ISSET(fd, &rfds)) {
 			sl = sizeof(sq);
 			/* Reserve one byte so an ERROR message can be NUL-terminated */
@@ -1110,30 +1266,10 @@ int main(int argc, char **argv)
 				return ret;
 			}
 
-			/* Ignore control messages */
 			if (sq.sq_port == QRTR_PORT_CTRL) {
-				ret = qrtr_decode(&pkt, buf, len, &sq);
-				if (ret < 0) {
-					fprintf(stderr, "unable to decode qrtr packet\n");
+				ret = handle_control(buf, len, &sq, local_node);
+				if (ret < 0)
 					return ret;
-				}
-
-				switch (pkt.type) {
-				case QRTR_TYPE_BYE:
-					log_debug("got bye for %d\n", pkt.node);
-					list_for_each_entry_safe(client, next, &writers, node) {
-						if (client->sq.sq_node == sq.sq_node)
-							client_close_and_free(client);
-					}
-					break;
-				case QRTR_TYPE_DEL_CLIENT:
-					log_debug("got del_client for %d:%d\n", pkt.node, pkt.port);
-					list_for_each_entry_safe(client, next, &writers, node) {
-						if (!memcmp(&client->sq, &sq, sizeof(sq)))
-							client_close_and_free(client);
-					}
-					break;
-				}
 			} else {
 				if (len < 2)
 					continue;

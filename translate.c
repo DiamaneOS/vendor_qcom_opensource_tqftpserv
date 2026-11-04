@@ -234,6 +234,86 @@ err:
 	return -1;
 }
 
+/* The size of an open file, by seeking: the domain's policy has no getattr on its files */
+static off_t rw_file_size(int fd)
+{
+	off_t current = lseek(fd, 0, SEEK_CUR);
+	off_t end = lseek(fd, 0, SEEK_END);
+
+	if (current < 0 || lseek(fd, current, SEEK_SET) < 0)
+		return -1;
+	return end;
+}
+
+/**
+ * rw_usage() - add up the readwrite directory
+ * @bytes:	size of its files
+ * @files:	number of its entries
+ *
+ * The server creates no subdirectories, so one level is all there is. Sizes
+ * count in full: a sparse file still reads back as that large.
+ *
+ * Return: 0 on success, -1 otherwise
+ */
+static int rw_usage(long long *bytes, int *files)
+{
+	struct dirent *de;
+	off_t size;
+	DIR *dir;
+	int fd;
+
+	*bytes = 0;
+	*files = 0;
+
+	dir = opendir(TQFTPSERV_RW_DIR);
+	if (!dir)
+		return errno == ENOENT ? 0 : -1;
+
+	while ((de = readdir(dir)) != NULL) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		(*files)++;
+		if (de->d_type != DT_REG)
+			continue;
+		fd = openat(dirfd(dir), de->d_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		size = rw_file_size(fd);
+		close(fd);
+		if (size > 0)
+			*bytes += size;
+	}
+	closedir(dir);
+
+	return 0;
+}
+
+/**
+ * translate_write_allowed() - check a write against the readwrite budgets
+ * @fd:		file about to be written at its current offset
+ * @len:	bytes about to be written
+ *
+ * Return: true if the write stays within the budgets
+ */
+bool translate_write_allowed(int fd, size_t len)
+{
+	long long end;
+	long long used;
+	off_t offset;
+	off_t size;
+	int files;
+
+	offset = lseek(fd, 0, SEEK_CUR);
+	size = rw_file_size(fd);
+	if (offset < 0 || size < 0 || rw_usage(&used, &files) < 0)
+		return false;
+	end = offset + (long long)len;
+	if (end > TQFTPSERV_MAX_FILE_BYTES)
+		return false;
+
+	return end <= size || used + end - size <= TQFTPSERV_MAX_RW_BYTES;
+}
+
 /**
  * translate_readwrite() - open "file" from the persistent readwrite directory
  * @file:	relative path of the requested file, with /readwrite/ stripped
@@ -246,7 +326,9 @@ err:
 static int translate_readwrite(const char *file, int flags)
 {
 	const char *name;
+	long long used;
 	int dirfd;
+	int files;
 	int ret;
 	int fd;
 	int err;
@@ -263,7 +345,16 @@ static int translate_readwrite(const char *file, int flags)
 		return -1;
 	}
 
-	fd = openat(dirfd, name, flags | O_NOFOLLOW, 0600);
+	fd = openat(dirfd, name, (flags & ~O_CREAT) | O_NOFOLLOW);
+	if (fd < 0 && errno == ENOENT && (flags & O_CREAT)) {
+		if (rw_usage(&used, &files) < 0 || files >= TQFTPSERV_MAX_RW_FILES) {
+			close(dirfd);
+			errno = ENOSPC;
+			warn("too many files for %s", file);
+			return -1;
+		}
+		fd = openat(dirfd, name, flags | O_NOFOLLOW, 0600);
+	}
 	err = errno;
 	close(dirfd);
 	errno = err;
