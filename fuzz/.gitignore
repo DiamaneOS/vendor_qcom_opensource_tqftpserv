@@ -4,6 +4,7 @@ fuzz_transfer
 fuzz_translate
 corpus/
 seeds/
+regress/
 artifacts/
 logs/
 crash-*
