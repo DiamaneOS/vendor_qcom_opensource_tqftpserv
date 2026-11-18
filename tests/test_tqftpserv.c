@@ -356,6 +356,27 @@ static void test_request_error_fills_buffer(void)
 	CHECK(tqftpserv_main(1, argv) == -EIO);
 }
 
+/* Bytes over 0x7f in a request's opcode or error code were shifted as negative values */
+static void test_request_high_bytes(void)
+{
+	static const char high_opcode[2] = { (char)0x80, 1 };
+	static const char high_error[6] = { 0, OP_ERROR, (char)0x80, 1, 'x', 0 };
+	static const char other[4] = { 0, 9, 0, 0 };
+	char *argv[] = { "tqftpserv", NULL };
+
+	ctrl_pkts[0] = high_opcode;
+	ctrl_lens[0] = sizeof(high_opcode);
+	ctrl_pkts[1] = high_error;
+	ctrl_lens[1] = sizeof(high_error);
+	ctrl_pkts[2] = other;
+	ctrl_lens[2] = sizeof(other);
+	ctrl_npkts = 3;
+	ctrl_reads_left = 2;
+	next_open_is_ctrl = true;
+	optind = 1;
+	CHECK(tqftpserv_main(1, argv) == -EIO);
+}
+
 /* A DATA packet shorter than its header underflowed the payload size */
 static void test_short_data_packet(void)
 {
@@ -977,6 +998,7 @@ static const struct {
 } tests[] = {
 	{ "session_error_fills_buffer", test_session_error_fills_buffer },
 	{ "request_error_fills_buffer", test_request_error_fills_buffer },
+	{ "request_high_bytes", test_request_high_bytes },
 	{ "short_data_packet", test_short_data_packet },
 	{ "absolute_path_escape", test_absolute_path_escape },
 	{ "client_calloc_failure", test_client_calloc_failure },

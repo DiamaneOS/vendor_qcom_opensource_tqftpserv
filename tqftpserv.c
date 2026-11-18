@@ -1274,7 +1274,8 @@ int main(int argc, char **argv)
 				if (len < 2)
 					continue;
 
-				opcode = buf[0] << 8 | buf[1];
+				/* char may be signed, and opcodes are unsigned */
+				opcode = (uint8_t)buf[0] << 8 | (uint8_t)buf[1];
 				switch (opcode) {
 				case OP_RRQ:
 					handle_rrq(buf, len, &sq);
@@ -1288,7 +1289,8 @@ int main(int argc, char **argv)
 						break;
 					buf[len] = '\0';
 					log_err("received error %d from %d:%d: %s\n",
-						buf[2] << 8 | buf[3], sq.sq_node, sq.sq_port, buf + 4);
+						(uint8_t)buf[2] << 8 | (uint8_t)buf[3],
+						sq.sq_node, sq.sq_port, buf + 4);
 					break;
 				default:
 					log_err("unhandled op %d from %d:%d\n",
