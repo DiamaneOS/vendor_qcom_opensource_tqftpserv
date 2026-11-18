@@ -257,34 +257,42 @@ static off_t rw_file_size(int fd)
 	return end;
 }
 
-/**
- * rw_usage() - add up the readwrite directory
- * @bytes:	size of its files
- * @files:	number of its entries
- *
- * The server creates no subdirectories, so one level is all there is. Sizes
- * count in full: a sparse file still reads back as that large.
- *
- * Return: 0 on success, -1 otherwise
+/* Deeper than this the readwrite directory counts as full */
+#define RW_MAX_DEPTH 8
+
+/*
+ * Adds up the directory at @path. Directories are opened with opendir(), not
+ * with open() and fdopendir(): bionic's fdopendir() calls fstat(), and the
+ * domain's policy has no getattr on its files. A subdirectory that does not
+ * open is not reachable by the server either.
  */
-static int rw_usage(long long *bytes, int *files)
+static int rw_usage_at(const char *path, int depth, long long *bytes, int *files)
 {
+	char sub[PATH_MAX];
 	struct dirent *de;
 	off_t size;
 	DIR *dir;
+	int ret = 0;
 	int fd;
 
-	*bytes = 0;
-	*files = 0;
-
-	dir = opendir(TQFTPSERV_RW_DIR);
+	dir = opendir(path);
 	if (!dir)
-		return errno == ENOENT ? 0 : -1;
+		return depth > 0 || errno == ENOENT ? 0 : -1;
 
 	while ((de = readdir(dir)) != NULL) {
 		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
 			continue;
 		(*files)++;
+		/* A link is DT_LNK, so links are not followed */
+		if (de->d_type == DT_DIR) {
+			if (depth >= RW_MAX_DEPTH ||
+			    snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name) >= (int)sizeof(sub) ||
+			    rw_usage_at(sub, depth + 1, bytes, files) < 0) {
+				ret = -1;
+				break;
+			}
+			continue;
+		}
 		if (de->d_type != DT_REG)
 			continue;
 		fd = openat(dirfd(dir), de->d_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -297,7 +305,26 @@ static int rw_usage(long long *bytes, int *files)
 	}
 	closedir(dir);
 
-	return 0;
+	return ret;
+}
+
+/**
+ * rw_usage() - add up the readwrite directory
+ * @bytes:	size of its files
+ * @files:	number of its entries
+ *
+ * The server creates no subdirectories, but a populated directory may have
+ * some, so they count too. Links are not followed. Sizes count in full: a
+ * sparse file still reads back as that large.
+ *
+ * Return: 0 on success, -1 otherwise
+ */
+static int rw_usage(long long *bytes, int *files)
+{
+	*bytes = 0;
+	*files = 0;
+
+	return rw_usage_at(TQFTPSERV_RW_DIR, 0, bytes, files);
 }
 
 /**

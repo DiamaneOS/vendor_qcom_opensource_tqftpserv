@@ -152,7 +152,45 @@ static off_t test_lseek(int fd, off_t offset, int whence)
 	return lseek(fd, offset, whence);
 }
 
+/* Whether @fd is the readwrite directory or one below it */
+static bool in_rw_dir(int fd)
+{
+	struct stat rw, st;
+	bool in = false;
+	int up, i;
+
+	if (stat(test_rw_dir, &rw) < 0)
+		return false;
+	fd = dup(fd);
+	for (i = 0; fd >= 0 && i < 64 && fstat(fd, &st) == 0; i++) {
+		if (st.st_dev == rw.st_dev && st.st_ino == rw.st_ino) {
+			in = true;
+			break;
+		}
+		up = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		close(fd);
+		fd = up;
+	}
+	if (fd >= 0)
+		close(fd);
+	return in;
+}
+
+/*
+ * On the phone the domain's policy has no getattr on the readwrite files,
+ * and bionic's fdopendir() calls fstat(), so it fails there.
+ */
+static DIR *test_fdopendir(int fd)
+{
+	if (in_rw_dir(fd)) {
+		errno = EACCES;
+		return NULL;
+	}
+	return fdopendir(fd);
+}
+
 #define recvfrom test_recvfrom
+#define fdopendir test_fdopendir
 #define connect test_connect
 #define getsockname test_getsockname
 #define calloc test_calloc
@@ -999,6 +1037,63 @@ static void test_write_budgets(void)
 	write_request("/readwrite/n0", "x", "timeoutms", "5000");
 }
 
+/* A populated folder has subfolders, and what is in them counts too */
+static void test_budgets_count_subfolders(void)
+{
+	struct tftp_client *client;
+	char path[PATH_MAX];
+	char name[32];
+	char buf[1024];
+	size_t len;
+	int i;
+
+	/* Files: the subfolder and all but one of the files in it fill it */
+	rw_path(path, "sub");
+	CHECK(mkdir(path, 0700) == 0);
+	for (i = 0; i < TQFTPSERV_MAX_RW_FILES - 2; i++) {
+		snprintf(name, sizeof(name), "sub/n%d", i);
+		write_file(rw_path_of(path, name), "");
+	}
+	write_request("/readwrite/sub/last", "x", "timeoutms", "5000");
+	len = request(buf, OP_WRQ, "/readwrite/extra", "blksize", "512", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
+	CHECK(!exists(rw_path_of(path, "extra")));
+	for (i = 0; i < TQFTPSERV_MAX_RW_FILES - 2; i++) {
+		snprintf(name, sizeof(name), "sub/n%d", i);
+		CHECK(unlink(rw_path_of(path, name)) == 0);
+	}
+
+	/* Bytes: a sparse file in the subfolder, just under the total */
+	rw_path(path, "sub/fill");
+	write_file(path, "");
+	CHECK(truncate(path, TQFTPSERV_MAX_RW_BYTES - 4) == 0);
+	len = request(buf, OP_WRQ, "/readwrite/t", "blksize", "512", "timeoutms", "5000", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	client = newest(&writers);
+	CHECK(client);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_OACK);
+	CHECK(send_data(client, 1, "abcd", 4) == -1);
+	CHECK(reply_opcode(peer_of[client->sock], buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
+	client_close_and_free(client);
+	CHECK(unlink(path) == 0);
+
+	/* A folder deeper than the count goes counts as full */
+	rw_path(path, "d");
+	for (i = 0; i < 10; i++) {
+		CHECK(mkdir(path, 0700) == 0);
+		strcat(path, "/d");
+	}
+	len = request(buf, OP_WRQ, "/readwrite/deep", "blksize", "512", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
+}
+
 /* The name service reports a client or a node going away, as on a modem restart */
 static void test_control_ends_sessions(void)
 {
@@ -1087,6 +1182,7 @@ static const struct {
 	{ "idle_sessions_end", test_idle_sessions_end },
 	{ "stray_packet_keeps_the_session", test_stray_packet_keeps_the_session },
 	{ "write_budgets", test_write_budgets },
+	{ "budgets_count_subfolders", test_budgets_count_subfolders },
 	{ "control_ends_sessions", test_control_ends_sessions },
 	{ "bad_control_packet", test_bad_control_packet },
 };
