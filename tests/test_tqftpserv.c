@@ -644,6 +644,28 @@ static void test_seek_past_off_t(void)
 	CHECK(!strcmp(buf, "0123456789"));
 }
 
+/* Where ssize_t has 32 bits, a large tsize wrapped and came back changed */
+static void test_tsize_past_ssize_t(void)
+{
+	char buf[1024];
+	const char *value;
+	size_t len;
+	ssize_t n;
+
+	len = request(buf, OP_WRQ, "/readwrite/ts", "blksize", "512", "tsize", "2666666666", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	n = reply(last_peer, buf, sizeof(buf));
+	CHECK(n >= 4);
+	if (buf[1] == OP_ERROR) {
+		CHECK(buf[3] == TFTP_ERROR_EOPTNEG);
+		CHECK(list_empty(&writers));
+		return;
+	}
+	CHECK(buf[1] == OP_OACK);
+	value = oack_option(buf, n, "tsize");
+	CHECK(value && !strcmp(value, "2666666666"));
+}
+
 /* Writing files */
 
 static void test_no_symlinks_followed(void)
@@ -1232,6 +1254,7 @@ static const struct {
 	{ "unlink_stays_inside", test_unlink_stays_inside },
 	{ "unlink_in_rrq", test_unlink_in_rrq },
 	{ "seek_past_off_t", test_seek_past_off_t },
+	{ "tsize_past_ssize_t", test_tsize_past_ssize_t },
 	{ "no_symlinks_followed", test_no_symlinks_followed },
 	{ "write_truncates_without_seek", test_write_truncates_without_seek },
 	{ "rejected_write_keeps_the_file", test_rejected_write_keeps_the_file },

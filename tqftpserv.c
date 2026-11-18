@@ -424,7 +424,9 @@ static int parse_options(const char *buf, size_t len, size_t *blksize,
 		} else if (!strcmp(opt, "tsize")) {
 			errno = 0;
 			parsed_val = strtoll(value, &endptr, 10);
-			if (errno != 0 || *endptr != '\0' || parsed_val < 0) {
+			/* ssize_t has 32 bits on 32-bit builds */
+			if (errno != 0 || *endptr != '\0' || parsed_val < 0 ||
+			    (ssize_t)parsed_val != parsed_val) {
 				log_err("Invalid tsize value '%s'\n", value);
 				return -1;
 			}
