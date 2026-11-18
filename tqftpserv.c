@@ -93,6 +93,9 @@ struct tftp_client {
 	uint16_t blk_expected;
 
 	long long last_active_ms;
+
+	/* A writer's file below /readwrite/ (translate_rw_name()), or NULL */
+	char *rw_name;
 };
 
 static bool tftp_debug;
@@ -638,6 +641,18 @@ out_close_sock:
 	close(sock);
 }
 
+/* Whether a transfer is writing the read-write file @name */
+static bool rw_name_written(const char *name)
+{
+	struct tftp_client *client;
+
+	list_for_each_entry(client, &writers, node) {
+		if (client->rw_name && !strcmp(client->rw_name, name))
+			return true;
+	}
+	return false;
+}
+
 /**
  * handle_unlink() - delete a file on request of the client
  * @filename: path requested in the WRQ
@@ -652,9 +667,20 @@ out_close_sock:
 static void handle_unlink(const char *filename, struct sockaddr_qrtr *sq,
 			  size_t blksize, unsigned int timeoutms)
 {
+	char name[PATH_MAX];
 	int sock;
 	int ret;
 	int err;
+
+	/*
+	 * A writer would go on writing the deleted file outside the readwrite
+	 * budget. The modem deletes only files it has finished with.
+	 */
+	if (translate_rw_name(filename, name) == 0 && name[0] && rw_name_written(name)) {
+		log_err("unlink of %s refused, a transfer is writing it\n", filename);
+		tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "File in use");
+		return;
+	}
 
 	if (translate_unlink(filename) < 0) {
 		err = errno;
@@ -686,6 +712,8 @@ static void handle_unlink(const char *filename, struct sockaddr_qrtr *sq,
 static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 {
 	struct tftp_client *client;
+	char rw_name[PATH_MAX];
+	size_t name_size;
 	const char *filename;
 	const char *mode;
 	const char *p;
@@ -756,6 +784,13 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 
 	if (do_unlink) {
 		handle_unlink(filename, sq, blksize, timeoutms);
+		return;
+	}
+
+	if (translate_rw_name(filename, rw_name) < 0) {
+		log_err("write with too long a name requested from %d:%d\n",
+			sq->sq_node, sq->sq_port);
+		tftp_send_error_to(sq, TFTP_ERROR_EACCESS, "Access violation");
 		return;
 	}
 
@@ -843,6 +878,17 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
+	if (rw_name[0]) {
+		name_size = strlen(rw_name) + 1;
+		client->rw_name = calloc(1, name_size);
+		if (!client->rw_name) {
+			log_err("Memory allocation failure\n");
+			tftp_send_error(sock, TFTP_ERROR_UNDEF, "Resources temporary unavailable");
+			goto out_free_rw_buf;
+		}
+		memcpy(client->rw_name, rw_name, name_size);
+	}
+
 	/*
 	 * Without "seek" the request writes the whole file, so what was there
 	 * before is dropped, as Qualcomm's server does. With "seek" the client
@@ -852,7 +898,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	if (seek < 0 && ftruncate(fd, 0) < 0) {
 		log_err("unable to truncate %s (%d), reject\n", filename, errno);
 		tftp_send_error(sock, TFTP_ERROR_UNDEF, "Truncate failed");
-		goto out_free_rw_buf;
+		goto out_free_rw_name;
 	}
 
 	log_info("%s opened for writing from %d:%d\n", filename, sq->sq_node, sq->sq_port);
@@ -873,6 +919,8 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 
 	return;
 
+out_free_rw_name:
+	free(client->rw_name);
 out_free_rw_buf:
 	free(client->rw_buf);
 out_free_blk_buf:
@@ -1075,6 +1123,7 @@ static void client_close_and_free(struct tftp_client *client)
 	close(client->fd);
 	free (client->blk_buf);
 	free (client->rw_buf);
+	free(client->rw_name);
 	free(client);
 }
 

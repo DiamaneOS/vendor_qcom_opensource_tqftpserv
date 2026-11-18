@@ -24,8 +24,9 @@
  * At the end of the input every node with a session gets a BYE, then the
  * service socket fails and main() must return.
  *
- * With FZ_COUNT_UNLINKED set, bytes in unlinked files still open for writing
- * count against the readwrite budget as well.
+ * Bytes in unlinked files still open for writing count against the readwrite
+ * budget as well. The server refuses to delete a file under write, so there
+ * should be none.
  */
 #include "fuzz_common.h"
 
@@ -60,7 +61,6 @@ static struct {
 } ev;
 
 static uint8_t pkt[4096 + 70000];
-static bool count_unlinked;
 static struct fz_usage usage;
 static int base_fds;
 static size_t base_alloc;
@@ -183,8 +183,8 @@ static void check_state(struct timeval *tv)
 	for (i = 0; i < n; i++) {
 		struct stat st;
 
-		/* Opt-in: count what unlinked files under write still hold */
-		if (count_unlinked && fz_is_writer(list[i]) &&
+		/* Count what unlinked files under write still hold */
+		if (fz_is_writer(list[i]) &&
 		    fstat(list[i]->fd, &st) == 0 && st.st_nlink == 0)
 			fz_extra_bytes += st.st_size;
 		fz_check_session(list[i], fz_is_writer(list[i]));
@@ -445,7 +445,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	int ret;
 
 	fz_init_once();
-	count_unlinked = getenv("FZ_COUNT_UNLINKED") != NULL;
 	fz_in = data;
 	fz_in_len = size;
 	fz_in_pos = 0;

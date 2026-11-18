@@ -15,6 +15,7 @@
 int sanitize_path(const char *path);
 int translate_open(const char *path, int flags);
 int translate_unlink(const char *path);
+int translate_rw_name(const char *path, char *out);
 bool translate_write_allowed(int fd, size_t len);
 
 #endif

@@ -575,6 +575,44 @@ static void test_unlink(void)
 	CHECK(buf[3] == TFTP_ERROR_ENOENT);
 }
 
+/* A file under write is not deleted, under any spelling of its name */
+static void test_unlink_refused_while_written(void)
+{
+	struct tftp_client *client;
+	char path[PATH_MAX];
+	char other[PATH_MAX];
+	char buf[1024];
+	ssize_t n;
+	size_t len;
+
+	rw_path(other, "other");
+	write_file(other, "x");
+	len = request(buf, OP_WRQ, "/readwrite/busy", "blksize", "512", "timeoutms", "5000", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	client = newest(&writers);
+	CHECK(client);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_OACK);
+	CHECK(exists(rw_path_of(path, "busy")));
+
+	len = request(buf, OP_WRQ, "/readwrite/./busy", "unlink", "0", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(newest(&writers) == client);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	CHECK(buf[3] == TFTP_ERROR_EACCESS);
+	CHECK(exists(path));
+
+	/* Other files still go */
+	len = request(buf, OP_WRQ, "/readwrite/other", "unlink", "0", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_OACK);
+	CHECK(!exists(other));
+
+	/* Once the transfer has ended the file can go */
+	client_close_and_free(client);
+	CHECK(unlink_request("/readwrite/busy", buf, sizeof(buf), &n) == OP_OACK);
+	CHECK(!exists(path));
+}
+
 static void test_unlink_stays_inside(void)
 {
 	char secret[PATH_MAX];
@@ -1251,6 +1289,7 @@ static const struct {
 	{ "client_calloc_failure", test_client_calloc_failure },
 	{ "tsize_failure_closes_the_file", test_tsize_failure_closes_the_file },
 	{ "unlink", test_unlink },
+	{ "unlink_refused_while_written", test_unlink_refused_while_written },
 	{ "unlink_stays_inside", test_unlink_stays_inside },
 	{ "unlink_in_rrq", test_unlink_in_rrq },
 	{ "seek_past_off_t", test_seek_past_off_t },

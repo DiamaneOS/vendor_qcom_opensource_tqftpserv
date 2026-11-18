@@ -63,6 +63,7 @@ Checks, in order. A failed check sends the error shown and stops:
 | path check fails (see Paths) | 2 "Access violation" | same |
 | options do not parse | 8 "Option negotiation failed" | same |
 | `unlink` option | 8 "Option negotiation failed" | delete, see Delete |
+| name below `/readwrite/` of PATH_MAX or more | (not checked) | 2 "Access violation" |
 | blksize × wsize over 1 MiB | (not checked) | 8 "Option negotiation failed" |
 | seek over 16 MiB | (not checked) | 3 "File too large" |
 | no session slot (see Limits) | 0 "Too many transfers" | same |
@@ -167,6 +168,9 @@ blksize + 4 bytes of each packet, so a longer one is cut to a full block.
 A WRQ with the `unlink` option, whatever its value.
 
 - Only paths under `/readwrite/`. Anything else gets 2 "Access violation".
+- A file a transfer is writing, under any spelling of its name: 2 "File in
+  use". The writer would go on outside the readwrite budget, and the modem
+  deletes only files it has finished with.
 - The path is walked as for writing, without following links. The last name
   is removed with `unlinkat()`: a link is removed itself, a directory is
   refused.
@@ -271,9 +275,7 @@ count as activity.
    "Truncate failed", with `seek` the first write fails.
 9. A WRQ that creates a file and then fails leaves the file, empty.
 10. Two transfers may use the same file. A WRQ without seek truncates it under
-    a running read or write, and a delete removes it under them. A transfer
-    whose file was deleted keeps writing to it, and those bytes no longer
-    count against the readwrite budget.
+    a running read or write, and a delete removes it under a running read.
 11. `/readonly/firmware/modem_pr` matches without a slash, so
     `/readonly/firmware/modem_prX` is looked up as `modem_prX`.
 12. A directory can be opened for reading. Its reads fail with "Read error".

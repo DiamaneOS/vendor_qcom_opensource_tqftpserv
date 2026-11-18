@@ -776,7 +776,7 @@ static void fz_check_session(struct tftp_client *c, bool writer)
 }
 
 /* The memory sessions may hold: the client, its block buffer and its window */
-#define FZ_SESSION_BYTES (sizeof(struct tftp_client) + MAX_BLKSIZE + 4 + MAX_WINDOW_BYTES)
+#define FZ_SESSION_BYTES (sizeof(struct tftp_client) + MAX_BLKSIZE + 4 + MAX_WINDOW_BYTES + PATH_MAX)
 #define FZ_SLACK_BYTES (256 * 1024)
 
 static size_t fz_allocated(void)

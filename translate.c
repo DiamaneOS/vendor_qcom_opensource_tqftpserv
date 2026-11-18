@@ -513,6 +513,44 @@ int translate_unlink(const char *path)
 	return ret;
 }
 
+/**
+ * translate_rw_name() - the file a read-write path names
+ * @path:	requested path, checked by sanitize_path()
+ * @out:	buffer of PATH_MAX bytes for the name below /readwrite/
+ *
+ * Drops empty and "." components, so every spelling of a file gives one
+ * name. Links are not followed and the server cannot make hard links, so two
+ * equal names are the same file. A path outside /readwrite/ gives an empty
+ * name.
+ *
+ * Return: 0 on success, -1 if the name does not fit
+ */
+int translate_rw_name(const char *path, char *out)
+{
+	const char *p;
+	size_t n = 0;
+	size_t len;
+
+	out[0] = '\0';
+	if (strncmp(path, READWRITE_PATH, strlen(READWRITE_PATH)))
+		return 0;
+
+	for (p = path + strlen(READWRITE_PATH); *p; p += len + (p[len] == '/')) {
+		len = strcspn(p, "/");
+		if (len == 0 || (len == 1 && p[0] == '.'))
+			continue;
+		if (n + 1 + len >= PATH_MAX)
+			return -1;
+		if (n)
+			out[n++] = '/';
+		memcpy(out + n, p, len);
+		n += len;
+		out[n] = '\0';
+	}
+
+	return 0;
+}
+
 /* linux-firmware uses .xz as file extension */
 #define XZ_EXTENSION ".xz"
 /* linux-firmware uses .zst as file extension */
