@@ -1,0 +1,12 @@
+fuzz_request
+fuzz_session
+fuzz_transfer
+fuzz_translate
+corpus/
+seeds/
+artifacts/
+logs/
+crash-*
+leak-*
+oom-*
+timeout-*
