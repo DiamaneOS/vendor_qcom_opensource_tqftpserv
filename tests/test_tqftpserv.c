@@ -34,6 +34,10 @@
 
 static char test_rw_dir[PATH_MAX];
 static char outside_dir[PATH_MAX];
+/* Firmware and sysfs stand-ins, with a trailing slash on the firmware base */
+static char test_fw_base[PATH_MAX];
+static char test_rproc_dir[PATH_MAX];
+static char test_fw_param[PATH_MAX];
 
 /* Test end of each socket pair, by the server's fd */
 static int peer_of[MAX_FDS];
@@ -197,6 +201,9 @@ static DIR *test_fdopendir(int fd)
 #define lseek test_lseek
 #define main tqftpserv_main
 #define TQFTPSERV_RW_DIR test_rw_dir
+#define FIRMWARE_BASE test_fw_base
+#define REMOTEPROC_CLASS_DIR test_rproc_dir
+#define FW_PATH_PARAM test_fw_param
 #include "../tqftpserv.c"
 #include "../translate.c"
 #undef recvfrom
@@ -1094,6 +1101,43 @@ static void test_budgets_count_subfolders(void)
 	CHECK(buf[3] == TFTP_ERROR_ENOSPACE);
 }
 
+/*
+ * The firmware path was sized by the length of the remoteproc's firmware
+ * name, but built from its directory part, which is "." for an empty name.
+ * A request of the right length then wrote one byte past the path.
+ */
+static void test_firmware_path_length(void)
+{
+	static char req[PATH_MAX + 64];
+	static char buf[PATH_MAX + 128];
+	char path[PATH_MAX];
+	size_t len;
+	size_t n;
+	int fd;
+
+	CHECK(mkdir(test_fw_base, 0700) == 0);
+	CHECK(mkdir(test_rproc_dir, 0700) == 0);
+	snprintf(path, sizeof(path), "%s/remoteproc0", test_rproc_dir);
+	CHECK(mkdir(path, 0700) == 0);
+	strcat(path, "/firmware");
+	fd = open(path, O_WRONLY | O_CREAT, 0600);
+	CHECK(fd >= 0);
+	close(fd);
+
+	/* Fills the path but for its NUL, if "." counts as no byte */
+	n = PATH_MAX - strlen(test_fw_base) - strlen("updates/") - 2;
+	len = stpcpy(req, "/readonly/firmware/image/") - req;
+	memset(req + len, 'a', n);
+	req[len + n] = '\0';
+	for (size_t i = len + 1; i < len + n; i += 2)
+		req[i] = '/';
+
+	len = request(buf, OP_RRQ, req, NULL);
+	handle_rrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&readers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+}
+
 /* The name service reports a client or a node going away, as on a modem restart */
 static void test_control_ends_sessions(void)
 {
@@ -1183,6 +1227,7 @@ static const struct {
 	{ "stray_packet_keeps_the_session", test_stray_packet_keeps_the_session },
 	{ "write_budgets", test_write_budgets },
 	{ "budgets_count_subfolders", test_budgets_count_subfolders },
+	{ "firmware_path_length", test_firmware_path_length },
 	{ "control_ends_sessions", test_control_ends_sessions },
 	{ "bad_control_packet", test_bad_control_packet },
 };
@@ -1213,6 +1258,9 @@ static bool run(int i, const char *tmp)
 	snprintf(test_rw_dir, sizeof(test_rw_dir), "%s/rw", base);
 	snprintf(outside_dir, sizeof(outside_dir), "%s/outside", base);
 	snprintf(log, sizeof(log), "%s/log", base);
+	snprintf(test_fw_base, sizeof(test_fw_base), "%s/fw/", base);
+	snprintf(test_rproc_dir, sizeof(test_rproc_dir), "%s/remoteproc", base);
+	snprintf(test_fw_param, sizeof(test_fw_param), "%s/fw_path", base);
 	if (mkdir(test_rw_dir, 0700) < 0 || mkdir(outside_dir, 0700) < 0)
 		err(1, "mkdir");
 

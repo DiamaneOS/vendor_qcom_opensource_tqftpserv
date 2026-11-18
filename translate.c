@@ -141,7 +141,7 @@ static int translate_readonly(const char *file)
 
 		/* first try path from sysfs */
 		if ((strlen(fw_sysfs_path) > 0) &&
-		    (strlen(fw_sysfs_path) + 1 + strlen(firmware_value) + 1 + strlen(file) + 1 < sizeof(path))) {
+		    (strlen(fw_sysfs_path) + 1 + strlen(firmware_path) + 1 + strlen(file) + 1 < sizeof(path))) {
 			strcpy(path, fw_sysfs_path);
 			strcat(path, "/");
 			strcat(path, firmware_path);
@@ -155,8 +155,8 @@ static int translate_readonly(const char *file)
 				warn("failed to open %s", path);
 		}
 
-		/* now try with base path */
-		if (strlen(FIRMWARE_BASE) + strlen(UPDATES_DIR) + strlen(firmware_value) + 1 +
+		/* now try with base path. dirname() of an empty name is "." */
+		if (strlen(FIRMWARE_BASE) + strlen(UPDATES_DIR) + strlen(firmware_path) + 1 +
 		    strlen(file) + 1 > sizeof(path))
 			continue;
 
