@@ -578,8 +578,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 			log_err("unable to determine file size for %s: %s\n",
 				filename, strerror(errno));
 			tftp_send_error(sock, TFTP_ERROR_UNDEF, "Cannot determine file size");
-			goto out_close_sock;
-			return;
+			goto out_close_fd;
 		}
 		/* Reset file position to beginning */
 		lseek(fd, 0, SEEK_SET);
@@ -629,6 +628,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 
 out_free_client:
 	free(client);
+out_close_fd:
 	close(fd);
 out_close_sock:
 	close(sock);

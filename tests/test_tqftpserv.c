@@ -51,6 +51,9 @@ static int ctrl_reads_left;
 /* Fail the n-th calloc() from now (0: never) */
 static int fail_calloc_at;
 
+/* Fail a seek to the end, as on a directory on tmpfs */
+static bool fail_seek_end;
+
 /* What qrtr_decode() reports */
 static struct qrtr_packet decoded = { .type = QRTR_TYPE_DATA };
 
@@ -137,10 +140,20 @@ static void *test_calloc(size_t n, size_t size)
 	return calloc(n, size);
 }
 
+static off_t test_lseek(int fd, off_t offset, int whence)
+{
+	if (fail_seek_end && whence == SEEK_END) {
+		errno = EINVAL;
+		return -1;
+	}
+	return lseek(fd, offset, whence);
+}
+
 #define recvfrom test_recvfrom
 #define connect test_connect
 #define getsockname test_getsockname
 #define calloc test_calloc
+#define lseek test_lseek
 #define main tqftpserv_main
 #define TQFTPSERV_RW_DIR test_rw_dir
 #include "../tqftpserv.c"
@@ -149,6 +162,7 @@ static void *test_calloc(size_t n, size_t size)
 #undef connect
 #undef getsockname
 #undef calloc
+#undef lseek
 #undef main
 
 /* Helpers */
@@ -245,6 +259,16 @@ static void read_file(const char *path, char *out, size_t len)
 	CHECK(n >= 0);
 	out[n] = '\0';
 	close(fd);
+}
+
+static int count_fds(void)
+{
+	int n = 0;
+	int fd;
+
+	for (fd = 0; fd < MAX_FDS; fd++)
+		n += fcntl(fd, F_GETFD) >= 0;
+	return n;
 }
 
 static bool exists(const char *path)
@@ -457,6 +481,27 @@ static void test_client_calloc_failure(void)
 	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
 	CHECK(list_empty(&writers));
 	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+}
+
+/* A read whose file size could not be found left the file open */
+static void test_tsize_failure_closes_the_file(void)
+{
+	char path[PATH_MAX];
+	char buf[1024];
+	size_t len;
+	int before;
+
+	rw_path(path, "z");
+	write_file(path, "0123456789");
+	before = count_fds();
+	len = request(buf, OP_RRQ, "/readwrite/z", "blksize", "512", "tsize", "0", NULL);
+	fail_seek_end = true;
+	handle_rrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	fail_seek_end = false;
+	CHECK(list_empty(&readers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	close(last_peer);
+	CHECK(count_fds() == before);
 }
 
 /* Deleting files */
@@ -1002,6 +1047,7 @@ static const struct {
 	{ "short_data_packet", test_short_data_packet },
 	{ "absolute_path_escape", test_absolute_path_escape },
 	{ "client_calloc_failure", test_client_calloc_failure },
+	{ "tsize_failure_closes_the_file", test_tsize_failure_closes_the_file },
 	{ "unlink", test_unlink },
 	{ "unlink_stays_inside", test_unlink_stays_inside },
 	{ "unlink_in_rrq", test_unlink_in_rrq },
