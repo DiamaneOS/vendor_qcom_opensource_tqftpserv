@@ -31,14 +31,23 @@
 #define READONLY_VENDOR_MNT_PATH	"/readonly/vendor/firmware_mnt/image/"
 
 #ifndef ANDROID
+/* The host tests (tests/, fuzz/) use directories of their own */
+#ifndef FIRMWARE_BASE
 #define FIRMWARE_BASE	"/lib/firmware/"
-/* The host tests (tests/) use a directory of their own */
+#endif
 #ifndef TQFTPSERV_RW_DIR
 #define TQFTPSERV_RW_DIR	"/var/lib/tqftpserv"
 #endif
 #else
 #define FIRMWARE_BASE	"/vendor/firmware/"
 #define TQFTPSERV_RW_DIR	"/data/vendor/tmp/tqftpserv"
+#endif
+
+#ifndef REMOTEPROC_CLASS_DIR
+#define REMOTEPROC_CLASS_DIR	"/sys/class/remoteproc"
+#endif
+#ifndef FW_PATH_PARAM
+#define FW_PATH_PARAM	"/sys/module/firmware_class/parameters/path"
 #endif
 
 static int open_maybe_compressed(const char *path);
@@ -51,7 +60,7 @@ static void read_fw_path_from_sysfs(char *outbuffer, size_t bufsize)
 	/* Empty unless a path is read below */
 	outbuffer[0] = '\0';
 
-	f = fopen("/sys/module/firmware_class/parameters/path", "rt");
+	f = fopen(FW_PATH_PARAM, "rt");
 	if (!f)
 		return;
 	pathsize = fread(outbuffer, sizeof(char), bufsize, f);
@@ -93,7 +102,7 @@ static int translate_readonly(const char *file)
 
 	read_fw_path_from_sysfs(fw_sysfs_path, sizeof(fw_sysfs_path));
 
-	class_fd = open("/sys/class/remoteproc", O_RDONLY | O_DIRECTORY);
+	class_fd = open(REMOTEPROC_CLASS_DIR, O_RDONLY | O_DIRECTORY);
 	if (class_fd < 0) {
 		warn("failed to open remoteproc class");
 		return -1;
