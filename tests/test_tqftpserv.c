@@ -627,6 +627,23 @@ static void test_unlink_in_rrq(void)
 	CHECK(exists(path));
 }
 
+/* Where off_t has 32 bits, seek 2^31 wrapped negative and read as no seek */
+static void test_seek_past_off_t(void)
+{
+	char path[PATH_MAX];
+	char buf[1024];
+	size_t len;
+
+	rw_path(path, "o");
+	write_file(path, "0123456789");
+	len = request(buf, OP_WRQ, "/readwrite/o", "blksize", "512", "seek", "2147483648", NULL);
+	handle_wrq(buf, len, (struct sockaddr_qrtr *)&remote);
+	CHECK(list_empty(&writers));
+	CHECK(reply_opcode(last_peer, buf, sizeof(buf)) == OP_ERROR);
+	read_file(path, buf, sizeof(buf));
+	CHECK(!strcmp(buf, "0123456789"));
+}
+
 /* Writing files */
 
 static void test_no_symlinks_followed(void)
@@ -1214,6 +1231,7 @@ static const struct {
 	{ "unlink", test_unlink },
 	{ "unlink_stays_inside", test_unlink_stays_inside },
 	{ "unlink_in_rrq", test_unlink_in_rrq },
+	{ "seek_past_off_t", test_seek_past_off_t },
 	{ "no_symlinks_followed", test_no_symlinks_followed },
 	{ "write_truncates_without_seek", test_write_truncates_without_seek },
 	{ "rejected_write_keeps_the_file", test_rejected_write_keeps_the_file },

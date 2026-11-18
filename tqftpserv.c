@@ -450,7 +450,9 @@ static int parse_options(const char *buf, size_t len, size_t *blksize,
 		} else if (!strcmp(opt, "seek")) {
 			errno = 0;
 			parsed_val = strtoll(value, &endptr, 10);
-			if (errno != 0 || *endptr != '\0' || parsed_val < MIN_SEEK) {
+			/* off_t has 32 bits on 32-bit builds */
+			if (errno != 0 || *endptr != '\0' || parsed_val < MIN_SEEK ||
+			    (off_t)parsed_val != parsed_val) {
 				log_err("Invalid seek value '%s' (must be >= %d)\n",
 					value, MIN_SEEK);
 				return -1;
