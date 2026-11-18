@@ -54,8 +54,9 @@ static int fail_calloc_at;
 /* Fail a seek to the end, as on a directory on tmpfs */
 static bool fail_seek_end;
 
-/* What qrtr_decode() reports */
+/* What qrtr_decode() reports, and its error if not 0 */
 static struct qrtr_packet decoded = { .type = QRTR_TYPE_DATA };
+static int decode_error;
 
 /* The next reads on a session socket seem to come from here, when set */
 static const struct sockaddr_qrtr *stray_sender;
@@ -98,6 +99,8 @@ int qrtr_publish(int sock, uint32_t service, uint16_t version, uint16_t instance
 int qrtr_decode(struct qrtr_packet *dest, void *buf, size_t len,
 		const struct sockaddr_qrtr *sq)
 {
+	if (decode_error)
+		return decode_error;
 	*dest = decoded;
 	return 0;
 }
@@ -1037,6 +1040,27 @@ static void test_control_ends_sessions(void)
 	CHECK(client->node.prev == &readers);
 }
 
+/* A control packet libqrtr cannot decode, as one under 20 bytes, ended main() */
+static void test_bad_control_packet(void)
+{
+	static const char short_ctrl[4] = { 3, 0, 0, 0 };
+	static const char other[4] = { 0, 9, 0, 0 };
+	const struct sockaddr_qrtr ns = { 42, LOCAL_NODE, QRTR_PORT_CTRL };
+	char *argv[] = { "tqftpserv", NULL };
+
+	ctrl_pkts[0] = short_ctrl;
+	ctrl_lens[0] = sizeof(short_ctrl);
+	ctrl_pkts[1] = other;
+	ctrl_lens[1] = sizeof(other);
+	ctrl_npkts = 2;
+	ctrl_reads_left = 1;
+	next_open_is_ctrl = true;
+	stray_sender = &ns;
+	decode_error = -EMSGSIZE;
+	optind = 1;
+	CHECK(tqftpserv_main(1, argv) == -EIO);
+}
+
 static const struct {
 	const char *name;
 	void (*fn)(void);
@@ -1064,6 +1088,7 @@ static const struct {
 	{ "stray_packet_keeps_the_session", test_stray_packet_keeps_the_session },
 	{ "write_budgets", test_write_budgets },
 	{ "control_ends_sessions", test_control_ends_sessions },
+	{ "bad_control_packet", test_bad_control_packet },
 };
 
 static void remove_tree(const char *path)

@@ -1125,10 +1125,11 @@ static int handle_control(void *buf, size_t len, const struct sockaddr_qrtr *sq,
 		return 0;
 	}
 
+	/* A packet that does not decode is dropped, like any other bad input */
 	ret = qrtr_decode(&pkt, buf, len, sq);
 	if (ret < 0) {
 		fprintf(stderr, "unable to decode qrtr packet\n");
-		return ret;
+		return 0;
 	}
 
 	switch (pkt.type) {
